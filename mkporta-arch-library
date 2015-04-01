@@ -1,0 +1,400 @@
+#!/bin/sh
+
+#################################################################################
+#    Mkporta-arch builds Arch Linux Operating Systems
+#    Copyright (C) 2014 Mark Lee
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+##################################################################################
+
+## dependencies : arch-install-scripts, gptfdisk, zramctl, xz
+
+create-img() {  ## create disk image
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: create-img <options> <arguments>
+
+  -z|--zram              |   allocate image on zram
+  -i|--image <path>      |   create raw image at <path>
+
+Examples:
+   create-img -i /tmp/test.img 2G;   # useful for usb's, create a 2GB raw disk image /tmp/test.img
+   create-img -z 2G;                 # create 2GB compressed block device with zram
+
+HELPEOF
+   }
+  case "$1" in
+    -h|--help|/?)
+      help-man;;                                         ## display the help manual
+    -z|--zram)
+      lsmod | grep zram \
+        || modprobe zram num_devices=$(($(nproc)+1));    ## load zram if it isn't loaded
+      zramctl find "$2" lzo $(nproc) &&                  ## generate block device of size
+      zramctl status | tail -1 | awk '{print $1}' ||
+      echo "Unable to create block device. Check zram";  ## error
+      shift 1;                                           ## remove one argument from parser
+      ;;
+    -i|--image)
+      fallocate -l $3 $2 &&                              ## allocate raw disk image at <path>
+      echo $2 ||                                         ## return path of disk image
+      echo "Unable to create image";                     ## error
+      shift 2;
+      ;;
+  esac;
+}
+
+cut-partitions() {  ## cut partitions on disk{,image}
+   type-part() { ## label partition; arguments : <name> <type> <disk>
+     part_num=$(sgdisk -p "$3" | tail -1 \
+               | awk '{print $1}') &&                     ## get last cut partition
+     sgdisk -c $part_num:$1 -t $part_num:$2 "$3";         ## label and type partition
+   }
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: cut-partitions <options> <arguments>
+
+  -d|--disk <path>       |   format <path>; can be disk image
+  -t|--transfer <size>   |   create an empty partition of size <size>(bBmMgG)
+  -s|--swap <size>       |   create a swap partition of size <size>(bBmMgG)
+  -e|--efi               |   create the efi boot partition
+  -ue|--usb-efi          |   create a 32MB fat32 efi boot partition
+  -h|--home <size>       |   create a home partition of size <size>(bBmMgG)
+
+By default, cut-partitions will cut a root-partition.
+
+Examples:
+   cut-partitions -d /dev/sda -t 2G -e -s 256M;  # useful for usb's, create a 2GB transfer partition
+                                                   create efi boot partition, create 256M swap,
+                                                   use the rest of space in /dev/sda to create root
+   cut-partitions -d /tmp/test.img -e -s 2G;     # useful for images, create efi boot partition,
+                                                   create 2G swap, use the rest of space in /tmp/test.img
+                                                   to create root
+   cut-partitions -d /dev/sda -e -s 2G -h 10G;   # useful for hdds, create efi boot partition,
+                                                   crate 2G swap, create 10G home partition,
+                                                   use the rest of the space in /dev/sda to create root
+
+HELPEOF
+   }
+  case "$1" in
+     -h|--help|/?)
+       help-man;;
+     -d|--disk)
+       sgdisk -og "$2" &&                                ## write gpt partition table to disk
+       disk="$2" &&                                      ## store the name of the disk
+       shift 2;                                          ## remove two arguments from parser
+       cut-partitions $@;                                ## iterate
+       ;;
+     -e|--efi)
+       sgdisk -n 0:0:+100M "$disk" &&                    ## cut EFI partition
+       type-part EFI ef00 "$disk" &&                     ## set efi attribute 
+       shift 1;                                          ## remove argument from parser
+       cut-partitions $@;                                ## iterate
+       ;;
+     -ue|--usb-efi)
+       sgdisk -n 0:0:+32M "$disk" &&                    ## cut EFI partition
+       type-part EFI ef00 "$disk" &&                     ## set efi attribute 
+       shift 1;                                          ## remove argument from parser
+       cut-partitions $@;                                ## iterate
+       ;;
+     -t|--transfer)
+       sgdisk -n 0:0:+$2 "$disk" &&                      ## cut transfer partition
+       type-part TRANSFER 8200 "$disk" &&                ## set linux fs attribute and label
+       shift 2;                                          ## remove two arguments from parser
+       cut-partitions $@;                                ## iterate
+       ;;
+     -s|--swap)
+       sgdisk -n 0:0:+$2 "$disk" &&                      ## cut swap partition
+       type-part SWAP 8200 "$disk" &&                    ## set swap attribute
+       shift 2;                                          ## remove two arguments from parser
+       cut-partitions $@;                                ## iterate
+       ;;
+     -h|--home)
+       sgdisk -n 0:0:+$2 "$disk" &&                      ## cut home partition
+       type-part HOME 8302 "$disk" &&                    ## set Linux /home attribute
+       shift 2;                                          ## remove two arguments from parser
+       cut-partitions $@;                                ## iterate
+       ;;
+     *)
+       sgdisk -n -N "$disk" &&                           ## cut partition with rest of space
+       type-part ROOT 8300 "$disk" &&                    ## set root attribute
+       sgdisk -p "$disk";                                ## print partition table
+       ;;
+   esac;
+}
+
+format-img() {  ## make filesystems on disk image
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: format-img <options> <arguments>
+
+  -l|--label <label> <fstype>        |   try to format partition to <fstype>
+                                     |     based on partition <label> in <path>
+  -e|--encrypt <path>                |   format luks encrypted partition at <path>
+  -s|--swap <path>                   |   format swap on <path>
+  -p|--partition <path> <fstype>     |   format <path> to <fstype> 
+
+Examples:
+   ## ROOT = btrfs, /dev/sda2 = swap, HOME = ext4
+   format-img -l ROOT /dev/sda3 btrfs -s /dev/sda2 -p /dev/sda3 ext4;
+                                             
+HELPEOF
+   } 
+  case "$1" in
+    -h|--help|/?)
+      help-man;                                          ## display the help manual
+      ;;
+    -e|--encrypt)
+      cryptsetup -t luksFormat $2 &&                     ## generate luks encrypted partion at $2
+      shift 2;                                           ## remove two arguments from parser
+      format-img $@;                                     ## iterate
+      ;;
+    -l|--label)
+      format-img -p $3 \
+      $(sgdisk -p $2 | awk "/$2/ {print \$1}") &&        ## locate and format partition based on label
+      shift 3;                                           ## remove three arguments from parser
+      format-img $@;                                     ## iterate
+      ;;
+    -s|--swap)
+      mkswap $2 &&                                       ## generate swap partition
+      shift 2;                                           ## remove two arguments from parser
+      format-img $@;                                     ## iterate
+      ;;
+    -p|--partition)
+      mkfs.$3 $2;                                        ## generate partition of type $3 at $2
+      shift 3;                                           ## remove three arguments from parser
+      format-img $@;                                     ## iterate
+      ;;
+  esac;
+}
+
+map-img() { ## map disk image to system block num_devices
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: map-img <path>
+
+  <path>       |   map image partitions from <path> to /dev/mapper
+
+Examples:
+   map-img /tmp/test.img;   ## map partitions from /tmp/test.img
+                               to /dev/mapper
+                                             
+HELPEOF
+   } 
+  case "$1" in
+    -h|--help|/?)
+      help-man;                                          ## display the help manual
+      ;;
+    *.img|*.raw)
+      sudo losetup --show -f "$1";                       ## mount all image partitions to /dev/loop*
+      ;;
+    /dev/sd*|/dev/zram*)
+      echo "Don't need to map $1";
+      ;;                                                 ## don't need to map image
+    *)
+      echo "Not supported image type";                   ## error
+   esac;
+}
+
+mount-parts() {  ## mount partitions from image
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: mount-parts <options> <arguments>
+
+  -p|--path <path>       |   find image at <path>
+  -t|--target <path>     |   mount image at <path>
+
+Examples:
+   mount-parts -p /mnt base btrfs; # install Arch Linux to /mnt and install btrfs-progs
+                                             
+HELPEOF
+   }
+   case "$1" in
+    -p|--path)
+      map-img;                                           ## run the map image function to generate mount points
+      ;;
+    -t|--target)
+      if [ -e "$2" ]; then
+         target="$2" &&                                  ## set mount-point
+         shift 2;                                        ## remove one argument
+         mount-parts $@;                                 ## iterate
+        else
+         echo "Target doesn't exist";                    ## error
+      fi;
+      ;;
+    /dev/*)
+      case "$2" in
+        ROOT)
+          mount "$1" "$target";                           ## mount root
+          ;;
+        EFI|BOOT)
+          mount "$1" "$target"/boot;                      ## mount EFI/boot
+          ;;
+        HOME)
+          mount "$1" "$target"/home;                      
+          ;;
+      esac;
+      ;;
+    *)
+      num_parts=$(sgdisk -p "$1" | tail -1 \
+        | awk '{print $1}');                              ## get the number of partitions available
+      for ((i=1;i<=$num_parts;i++)); do
+        parts=($(sgdisk -p "$1" | tail -$num_parts \
+                | awk '{print $1,$7}' \ 
+                | head -$i | tail -1))                    ## add to array of partitions
+        mount-parts
+      done;
+      ;;
+   esac;
+}
+
+install-arch() { ## install arch linux
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: install-arch <options> <arguments>
+
+  -p|--path <path>       |   find mount point at <path>
+  base                   |   install Arch Linux via pacstrap to
+  bluerider              |   install Bluerider minimal desktop preset
+  btrfs                  |   install btrfs-progs
+
+Examples:
+   install-arch -p /mnt base btrfs; # install Arch Linux to /mnt and install btrfs-progs
+                                             
+HELPEOF
+   } 
+   case "$1" in
+    -h|--help|/?)
+      help-man;;                                         ## display the help manual
+    -p|--path)
+      if [ -e "$2" ]; then
+         path="$2" &&                                    ## set path of new arch linux root
+         shift 2;                                        ## remove two arguments
+         install-arch $@;                                ## iterate
+        else
+         echo "Couldn't find new root path";
+      fi;
+      ;;
+    base)
+      pacstrap -cd "$path"                               ## install Arch linux using host cache
+      shift 1;                                           ## remove one argument from parser
+      install-arch $@;                                   ## iterate
+      ;;
+    btrfs)
+      pacman -S btrfs-progs -r "$path" --noconfirm &&    ## install btrfs tools
+      shift 1;                                           ## remove one argument from parser
+      install-arch $@;                                   ## iterate
+      ;;
+    prototype-os)
+      pacman -S \
+        xf86-video-{intel,nouveau,ati} \
+        xorg-{server,xinit} mesa{,-{libgl,vdpau}} \
+        libva-{mesa,vdpau,intel}-driver \
+        openssh sshfs smbclient networkmanager sudo \
+        pidgin{,-{otr,libnotify}} mpv linphone \
+        zramctl \
+        -r "$path" --noconfirm &&                        ## install prototype-os presets
+        shift 1;                                         ## remove one argument from parser
+        install-arch $@;                                 ## iterate
+      ;;
+    bluerider)
+      install-arch prototype-os &&
+      pacman -S \
+        i3{-wm,lock,status} network-manager-applet \
+        pulseaudio{,-alsa} pavucontrol volumeicon \
+        nautilus file-roller gnome-disk-utility \
+        seahorse firefox flashplugin zsh \
+        thunderbird vlc mousepad \
+        -r "$path" --noconfirm &&                        ## install bluerider minimal desktop
+        shift 1;                                         ## remove one argument from parser
+        install-arch $@;                                 ## iterate
+      ;;
+    neiOS)
+      install-arch prototype-os &&
+      pacman -S \
+        gnome-{shell,control-center,-keyring} \
+        seahorse nautilus file-roller geary \
+        gedit firefox youtube-dl \
+        -r "$path" --noconfirm &&                        ## install neiOS presets
+        shift 1;                                         ## remove one argument from parser
+        install-arch $@;                                 ## iterate
+      ;;
+  esac;
+}
+
+comp-img() { ## compress disk image
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: comp-img <options> <arguments>
+
+  -p|--path <path>       |   find image at <path>
+  -t|--target <path>     |   send xz compressed image to <path>
+
+Examples:
+   comp-img -p /dev/zram0 -t /tmp/rootfs.xz; # compress /dev/zram0 with xz to /tmp/rootfs.xz
+                                             
+HELPEOF
+   } 
+  case "$1" in
+    -h|--help|/?)
+      help-man;                                          ## display the help manual
+      ;;
+    -p|--path)
+      if [ -e "$2" ]; then
+         path="$2" &&                                    ## set path of disk img
+         shift 2;                                        ## remove two arguments
+         comp-img $@;                                    ## iterate
+        else
+         echo "Couldn't find source path";
+      fi;
+      ;;
+    -t|--target)
+      target="$2" &&                                     ## set target
+      shift 2;                                           ## remove two arguments from parser
+      comp-img $@;                                       ## iterate
+      ;;
+     *)
+      if [[ -z "$path" || -z "$target" ]]; then
+        echo "Not all arguments supplied";               ## error
+        help-man;                                        ## display help manual
+       else
+        dd if=$path | xz -ze9 > $target;                 ## compress the image at <path> to <target>
+       fi;
+      ;;
+  esac;
+}
+
+unmount-img() { ## unmount partitions
+   help-man() {  ## help manual
+          cat <<HELPEOF
+usage: unmount-img <path>
+
+  <path>       |   unmount image partitions from <path>
+
+Examples:
+   unmount-img /dev/sda;   ## unmount image partitions from /dev/sda
+                                             
+HELPEOF
+   } 
+  case "$1" in
+    -h|--help|/?)
+      help-man;                                          ## display the help manual
+      ;;
+    *.img|/dev/zram*)
+      kpartx -d "$1";                                    ## unmount the partitions from block image/device
+      ;;
+    /dev/sd*)
+      ls -d /dev/* | grep "$1" | xargs umount;           ## unmount all partitions from disk
+      ;;
+  esac;
+}

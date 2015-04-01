@@ -1,0 +1,222 @@
+#!/bin/bash
+
+## copyright 2014 Mark Lee
+## GPLv3 License
+
+main() {  ## main insertion function
+  parse-args "$@";                                       ## parse command line arguments
+  check-setup;                                           ## make sure bare essentials are met
+  cut-partitions;                                        ## cut GPT partitions onto disk
+  format-partitions;                                     ## format filesystems on disk
+  mount-partitions;                                      ## mount generated partitions
+  install-arch;                                          ## install arch linux
+  post-install;                                          ## post-installation options
+  verify;                                                ## verify install
+}
+
+parse-args() {  ## parse command line arguments
+  args=("$@");                                           ## store cli in an array
+  for ((a=0;a<${#@};a++)); do                            ## process cli
+     case ${args[$a]} in                                 ## sort cli
+         -h|--help|/?)
+              help;                                      ## print help screen
+              exit;
+              ;;
+         -d|--disk)
+              disk="${args[$[a+1]]}";                    ## [needed] disk to format
+              ;;
+         -e|--encrypt)
+              encrypt="${args[$[a+1]]}";                 ## name for luks/dm-crypt container 
+              ;;
+         -s|--swap)
+              swap="${args[$[a+1]]}";                    ## size of swap partition (256M)
+              ;;
+         -n|--no-check)
+              alias check-setup="";                      ## remove ability to check environment
+              ;;
+         -t|--transfer-partition)
+              trans_part="${args[$[a+1]]}";              ## set transfer partition type and size (ntfs:2G)
+              ;;
+         -b|--boot)
+              boot="${args[$[a+1]]}";                    ## set the boot partition type
+              ;;
+         -nv|--no-verify)
+              alias verify=""                            ## remove ability to verify install
+              ;;
+         -nc|--no-cut)
+              alias cut-partitions="";                   ## remove ability to cut partitions
+              ;;
+         -nf|--no-format)
+              alias format-partitions="";                ## remove ability to format partitions
+              ;;
+         -nm|--no-mount)
+              alias mount-partitions="";                 ## remove ability to mount partitions
+              ;;
+         -ni|--no-install
+              alias install-arch="";                     ## remove ability to install Arch Linux
+              ;;
+         -m|--mount-point)
+              mount_point="${args[$[a+1]]}";             ## mount point for new arch installation
+              ;;
+         -vc|--volatile-cache)
+              volatile_cache="1";                        ## mount pacman-cache on tmpfs
+              ;;
+         -p|--packages)
+              packages="${args[$[a+1]]}";                ## set some extra packages to install
+              ;;
+         -c|--config)
+              config_use="1";                            ## toggle to ask user for post-install configuration
+              ;;
+     esac;
+  done;
+}
+
+check-setup() {  ## check that bare essentials are set
+  if [ "$UID" -eq "0" ]; then
+     alias sudo="";                                      ## if running as root remove ability to use sudo
+  fi;
+  declare -a need_progs=("gptfdisk"
+                         "arch-install-scripts"
+                         "btrfs-progs"
+                         "sed");                         ## needed pacman packages
+  for a in ${need_progs[@]}; do
+     pacman -Q $a || sudo pacman -S $a;                  ## install packages if they aren't installed
+  done;
+  
+  if [ ! -d ${mount_point:=/mnt} ]; then
+     sudo mkdir -p ${mount_point:=/mnt};                 ## make the temporary mount point if it doesn't exist
+  fi;
+  #/* PRINT OUT CHOSEN OPTIONS TO THE USER */                  
+}
+
+cut-partitions() {  ## cut partitions on disk
+   boot_num=1;                                           ## initialize boot partition #
+   sudo sgdisk -og "$disk";                              ## write gpt table to disk
+   if [ "$trans_part" ]; then 
+      sudo sgdisk -n 0:0:+${trans_part#*:} "$disk" &&    ## cut the transfer partition if needed
+      boot_num=$[boot_num+1];                            ## increase boot partition #
+   fi;
+   sudo sgdisk -n 0:0:+100M -c $boot_num:"EFI" \
+      -t $boot_num:ef00 "$disk" &&                       ## cut the boot partition and set it as efi boot
+   if [ "$swap" ]; then
+      boot_num=$[boot_num+1];
+      sudo sgdisk -n 0:0:+$swap -c $boot_num:"SWAP" \
+         -t $[boot_num+1]:8200 "$disk";                  ## cut a swap partition if requested
+   fi;
+   sudo sgdisk -n -N -c $[boot_num+1]:"Root" "$disk";    ## cut the root partition
+   sudo sgdisk -p "$disk";                               ## print the partition table
+}
+
+format-partitions() {  ## make filesystems on disk
+  part_num=1;                                            ## initialize zeroth partition number
+  if [ "$trans_part" ]; then
+     sudo mkfs.${trans_part%:*} $disk$part_num;          ## format transfer partition
+     part_num=$[part_num+1];                             ## increase partition number
+  fi;
+  sudo mkfs.${boot:=fat} $disk$part_num;                 ## format boot partition [default=fat]
+  part_num=$[part_num+1];                                ## increase partition number
+  if [ "$swap" ]; then                                   
+     sudo mkswap $disk$part_num;                         ## format swap partition
+     part_num=$[part_num+1];                             ## increase partition number
+  fi;
+  if [ "$encrypt" ]; then
+     sudo cryptsetup -t luksFormat $disk$part_num;       ## create luks/dm-crypt container
+     sudo cryptsetup open $disk$part_num "$encrypt";     ## open the container
+     sudo mkfs.btrfs /dev/mapper/$encrypt;               ## format encrypted root to btrfs
+   else
+     sudo mkfs.btrfs $disk$part_num;                     ## format root partition to btrfs
+  fi;
+  }
+
+mount-partitions() {  ## mount generated partitions
+  if [ "$trans_part" ]; then
+     boot_num=2;                                         ## if there's a transfer partition; boot is the second partition
+   else
+     boot_num=1;                                         ## boot is the first partition
+  fi;
+  if [ "$encrypt" ]; then
+     sudo mount -o defaults,compress=lzo \
+        /dev/mapper/$encrypt "${mount_point:=/mnt}";     ## mount decrypted volume
+   elif [ "$swap" ]; then
+     sudo mount -o defaults,compress=lzo \
+        $disk\$[boot_num+2] "${mount_point:=/mnt}";      ## mount root; if there's a swap partition, root is +2 away from boot
+   else
+     sudo mount -o defaults,compress=lzo \
+        $disk\$[boot_num+1] "${mount_point:=/mnt}";      ## mount root; root is +1 away from boot
+  fi;  
+  cd "${mount_point:=/mnt}";                             ## enter the new root
+  sudo btrfs subvolume create home;                      ## create a home subvolume in new root
+  sudo mkdir boot;                                       ## create the boot mount point
+  sudo mount $disk$boot_num "${mount_point:=/mnt}/boot"; ## mount new boot
+}
+
+install-arch() {  ## install arch linux
+   pacstrap "${mount_point:=/mnt}" base;                 ## install arch linux to new root
+   if [ "$packages" ]; then
+      sudo pacman -r "${mount_point:=/mnt}" -Syy ${packages[@]} \
+             syslinux gptfdisk dosfstools;               ## install extra packages if requested
+   fi;
+   sudo arch-chroot "${mount_point:=/mnt}" \
+     "syslinux-install_update -i -a -m";                 ## chroot into new install and install syslinux to mbr
+   if [ "$encrypt" ]; then
+      sed -i "s/filesystems/encrypt filesystems/" \
+        "${mount_point:=/mnt}/etc/mkinitcpio.conf";      ## append encrypt to mkinitcpio.conf hooks for encrypted root
+   fi;
+   #/* NEED TO EDIT FSTAB APPROPRIATELY */
+   genfstab -p -U 
+   #/* NEED TO EDIT SYSLINUX.CFG APPROPRIATELY */
+}
+
+post-install() {  ## post-installation options
+  if [ "$config" ]; then
+   else
+     echo "You have elected to configure your Arch Linux system manually, remember to do so!";
+  fi;
+}
+
+help() {
+  echo "
+  Usage: mkporta-arch [options] -d </dev/sd*>
+  
+         Options                                 Description                                 Example
+         --------                                ------------                                --------
+         -h |--help|/?                            print help screen                           -h
+         -d |--disk <name of disk>                specify disk to format                      -d /dev/sda
+         -e |--encrypt <name of container>        encrypt root and label                      -e cryptroot 
+         -s |--swap  <size>                       create a swap partition                     -s 256M
+         -n |--no-check                           don't check for required packages           -n
+         -t |--transfer-partition <size>          create a hot swappable storage partition    -t ntfs:4G
+         -b |--boot <partition type>              format the boot partition, default=fat      -b fat
+         -nv|--no-verify                          verify installation worked                  -nv
+         -m |--mount-point <dir>                  temporary mount directory for working       -m /mnt
+         -vc|--volatile-cache                     store pacman packages in volatile ram       -vc
+         -p |--packages '<packages>'              install additional packages in new OS       -p 'gnome'
+         
+  Examples:
+    1) No swap, no swappable storage, no root encryption, install to /dev/sda
+    
+           mkporta-arch -d /dev/sda
+
+    2) No swap, 4G FAT32 swappable storage, encrypted root named cryptroot, install to /dev/sda
+    
+           mkporta-arch -d /dev/sda -t fat:4G -e cryptroot
+           
+    3) No swap, 4G NTFS swappable storage, encrypted root named cryptroot, install to /dev/sdb, volatile package cache
+    
+           mkporta-arch -d /dev/sdb -t ntfs:4G -e cryptroot -vc
+           
+    4) No swap, ext2 boot partition, encrypted root named pool-locker, install to /dev/sdb, temporary mount in /tmp/mnt, install xfce4
+    
+           mkporta-arch -d /dev/sdb -b ext2 -e pool-locker -m /tmp/mnt -p 'xfce4'
+    
+    5) No swap, 4G NTFS swappable storage, encrypted root named pool-locker, install to /dev/sdb, volatile package cache, install gnome and kate
+    
+           mkporta-arch -d /dev/sdb -t ntfs:4G -e pool-locker -vc -p 'gnome kdesdk-kate'
+           
+    6) Print the help manual
+    
+           mkporta-arch -h
+  "
+}
+
+main "$@";  ## run the main insertion function
