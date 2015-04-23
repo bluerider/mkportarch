@@ -1,0 +1,50 @@
+#!/bin/bash
+
+## update USB OS
+
+## use a random mount point
+randomdir() {
+ rand_dir="$1/update-usb-$RANDOM";
+ if [ -d "$rand_dir" ]; then
+    randomdir
+   else
+    ## return the directory
+    echo "$rand_dir"
+ fi;
+}
+
+## use default value of /dev/sdb
+##  $1 = block device
+##  $2 = mount point
+##  $3 = mapped name
+##  $4 = [optional] break in chroot
+update-fun() {
+ if [[ -b "$1"  && ! -d "$2" ]]; then
+                                 ## strip /dev/mapper/
+    sudo cryptsetup open "${1}2" "${3#/dev/mapper/}" && 
+    sudo mkdir "$2" &&
+    sudo mount -o defaults,compress=zlib \
+       "$3" "$2" && 
+    sudo mount "${1}1" "$2"/boot && 
+    ## use host cache for pacman pkg cache
+    sudo mount --bind {,"$2"}/var/cache/pacman/pkg &&
+    ## check if a second argument was passed
+    if [ "$4" ]; then
+       sudo arch-chroot "$2";
+     else
+       ## if no argument was passed, just run update
+       sudo arch-chroot "$2" pacman -Syyu;
+    fi
+    sudo umount -R "$2" &&
+    sudo rm -r "$2" &&
+                          ## strip /dev/mapper/
+    sudo cryptsetup close "${3#/dev/mapper/}"
+  else
+    if [ ! -b "$1" ]; then
+       echo "Can't find $1"
+    fi
+ fi
+}
+
+## run the update functions
+update-fun "${1:-/dev/sdb}" "$(randomdir /run)" "$(randomdir /dev/mapper)" "$2"
